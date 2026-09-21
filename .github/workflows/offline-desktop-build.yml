@@ -54,8 +54,10 @@ jobs:
             os: macos-14
             jpdfium_platforms: darwin-arm64
             tauri_args: "--target aarch64-apple-darwin --bundles dmg"
+          # Intel 包在 arm64 runner（macos-14，资源充足）上交叉编译产出，
+          # 避开 GitHub 免费 macos-13 Intel runner 长期排队的问题。
           - name: macos-x86_64
-            os: macos-13
+            os: macos-14
             jpdfium_platforms: darwin-x64
             tauri_args: "--target x86_64-apple-darwin --bundles dmg"
     runs-on: ${{ matrix.os }}
@@ -94,6 +96,8 @@ jobs:
         with:
           distribution: temurin
           java-version: "25"
+          # 内置 JRE 必须与目标架构一致：Intel 交叉包用 x64 JDK
+          architecture: ${{ matrix.name == 'macos-x86_64' && 'x64' || '' }}
 
       - name: Setup Rust
         if: steps.pick.outputs.run == 'true'
