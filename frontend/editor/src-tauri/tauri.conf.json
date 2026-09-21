@@ -21,11 +21,14 @@
         "dragDropEnabled": false,
         "additionalBrowserArgs": "--enable-features=CertVerifierBuiltinFeature"
       }
-    ]
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; img-src 'self' asset: http://asset.localhost blob: data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'"
+    }
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "publisher": "Stirling PDF Inc.",
     "targets": ["deb", "rpm", "appimage", "dmg", "app", "msi"],
     "icon": [
@@ -90,16 +93,6 @@
     "deep-link": {
       "desktop": {
         "schemes": ["stirlingpdf"]
-      }
-    },
-    "updater": {
-      "endpoints": [
-        "https://github.com/Stirling-Tools/Stirling-PDF/releases/latest/download/latest.json"
-      ],
-      "dialog": false,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZEREM2QTgwNjdGNzdCOUQKUldTZGUvZG5nR3JjYmZ4TlZ3YVpHTVIzd2hBT2c4c000RDNIN2tLZENEblE4ZXFhU3J5V0lQanEK",
-      "windows": {
-        "installMode": "passive"
       }
     }
   }

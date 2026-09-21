@@ -210,11 +210,32 @@ fn run_stirling_pdf_jar(app: &tauri::AppHandle, java_path: &PathBuf, jar_path: &
         &log_path_option,
         "-Dlogging.file.name=stirling-pdf.log",
         "-Dserver.port=0",  // Let OS assign an available port
+        // Bind ONLY to loopback so the bundled backend is never reachable from
+        // the LAN even though its port is chosen dynamically.
+        "-Dserver.address=127.0.0.1",
         // No reverse proxy in front of the local sidecar, so don't trust forwarded headers.
         // Stops a LAN caller spoofing X-Forwarded-For to defeat the desktop-only signing gate.
         "-Dserver.forward-headers-strategy=none",
         "-Dsecurity.enableLogin=false",  // Disable login for desktop mode
         "-Dsecurity.csrfDisabled=true",  // Disable CSRF for desktop mode
+        // ---- Offline / air-gapped hardening (personal local build) ----
+        // Force-disable analytics + update-prompt switches regardless of any
+        // bundled/on-disk settings.yml, so the sidecar never reaches out to
+        // PostHog / Scarf / update endpoints. (Relaxed binding maps these onto
+        // the ApplicationProperties System fields.)
+        "-Dsystem.enableAnalytics=false",
+        "-Dsystem.enablePosthog=false",
+        "-Dsystem.enableScarf=false",
+        "-Dsystem.showUpdate=false",
+        // Disable features that inherently need an external server.
+        "-Dsystem.enableUrlToPDF=false",
+        "-DaiEngine.enabled=false",
+        // PDF signature trust: never fetch AATL/EUTL lists, issuer certs
+        // (AIA), CRL or OCSP over the network. Full property paths:
+        // security.validation.trust.{useAATL,useEUTL}, security.validation.allowAIA.
+        "-Dsecurity.validation.trust.useAATL=false",
+        "-Dsecurity.validation.trust.useEUTL=false",
+        "-Dsecurity.validation.allowAIA=false",
     ];
 
     // Enable the login agreement on local desktop installs when it has been provisioned.

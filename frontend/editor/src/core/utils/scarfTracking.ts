@@ -1,3 +1,5 @@
+import { isTauri } from "@tauri-apps/api/core";
+
 /**
  * Scarf analytics pixel tracking utility
  *
@@ -57,6 +59,13 @@ export function setScarfConfig(
  * @param pathname - The pathname to track (usually window.location.pathname)
  */
 export function firePixel(pathname: string): void {
+  // Personal offline/air-gapped desktop build: never fire the Scarf pixel
+  // from inside the Tauri shell. Drop queued calls too so they can't replay.
+  if (isTauri()) {
+    pendingPaths.length = 0;
+    return;
+  }
+
   // Pre-init: queue and bail. setScarfConfig() drains.
   if (!configured) {
     if (pendingPaths.length >= PENDING_PATHS_CAP) pendingPaths.shift();

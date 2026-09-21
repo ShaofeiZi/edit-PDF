@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import posthog from "posthog-js";
+import { isTauri } from "@tauri-apps/api/core";
 import { useAppConfig } from "@app/contexts/AppConfigContext";
 
 function applyPosthogConsent(): void {
@@ -51,6 +52,17 @@ export function usePosthogTracking(): void {
   const { config } = useAppConfig();
 
   useEffect(() => {
+    // Personal offline/air-gapped desktop build: never initialize PostHog or
+    // make any analytics call from inside the Tauri shell, regardless of the
+    // server-reported analytics flags. Web/self-hosted builds are unaffected.
+    if (isTauri()) {
+      if (posthog.__loaded) {
+        posthog.opt_out_capturing();
+        posthog.set_config({ persistence: "memory" });
+      }
+      return;
+    }
+
     const analyticsEnabled = config?.enableAnalytics === true;
     const posthogEnabled = analyticsEnabled && config?.enablePosthog !== false;
 

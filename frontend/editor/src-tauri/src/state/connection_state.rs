@@ -24,9 +24,9 @@ pub struct ConnectionState {
 impl Default for ConnectionState {
     fn default() -> Self {
         Self {
-            mode: ConnectionMode::SaaS,
+            mode: ConnectionMode::Local,
             server_config: None,
-            lock_connection_mode: false,
+            lock_connection_mode: true,
         }
     }
 }

@@ -16,47 +16,7 @@ const CONNECTION_MODE_KEY: &str = "connection_mode";
 const SERVER_CONFIG_KEY: &str = "server_config";
 const LOCK_CONNECTION_KEY: &str = "lock_connection_mode";
 const LOGIN_AGREEMENT_KEY: &str = "login_agreement_enabled";
-pub(crate) const UPDATE_MODE_KEY: &str = "update_mode";
-/// When `true` the update mode was written by a provisioning file and cannot
-/// be changed from the UI. Only another provisioning file (from MDM) can
-/// override it. We track this separately from `lock_connection_mode` because
-/// an admin may want to lock updates without locking the connection URL,
-/// or vice versa.
-pub(crate) const UPDATE_MODE_LOCKED_KEY: &str = "update_mode_locked";
 const PROVISIONING_FILE_NAME: &str = "stirling-provisioning.json";
-
-/// How the desktop auto-updater should behave on startup.
-///
-/// * `Prompt`   – default. Show the update popup when a new version is available
-///               and let the user decide whether to install.
-/// * `Auto`     – silently download and install updates on startup, then restart.
-///               Intended for managed deployments (Intune/MDM) where the user
-///               cannot (or should not) be prompted.
-/// * `Disabled` – never check for updates, never show the update UI. Administrators
-///                are expected to push updates through their normal packaging flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UpdateMode {
-    Prompt,
-    Auto,
-    Disabled,
-}
-
-impl Default for UpdateMode {
-    fn default() -> Self {
-        UpdateMode::Prompt
-    }
-}
-
-/// Current update mode plus whether the UI is allowed to change it. Returned
-/// by [`get_update_mode`] so the settings page can show a "managed by
-/// administrator" hint instead of silently ignoring clicks.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateModeInfo {
-    pub mode: UpdateMode,
-    pub locked: bool,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectionConfig {
@@ -67,27 +27,14 @@ pub struct ConnectionConfig {
 
 #[tauri::command]
 pub async fn get_connection_config(
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
     state: State<'_, AppConnectionState>,
 ) -> Result<ConnectionConfig, String> {
-    // Try to load from store
-    let store = app_handle
-        .store(STORE_FILE)
-        .map_err(|e| format!("Failed to access store: {}", e))?;
-
-    let mode = store
-        .get(CONNECTION_MODE_KEY)
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or(ConnectionMode::SaaS);
-
-    let server_config: Option<ServerConfig> = store
-        .get(SERVER_CONFIG_KEY)
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-    let lock_connection_mode = store
-        .get(LOCK_CONNECTION_KEY)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // Offline desktop build: ignore stale SaaS/self-hosted settings and expose
+    // only the bundled local backend.
+    let mode = ConnectionMode::Local;
+    let server_config: Option<ServerConfig> = None;
+    let lock_connection_mode = true;
 
     // Update in-memory state
     if let Ok(mut conn_state) = state.0.lock() {
@@ -109,9 +56,13 @@ pub async fn set_connection_mode(
     state: State<'_, AppConnectionState>,
     mode: ConnectionMode,
     server_config: Option<ServerConfig>,
-    lock_connection_mode: Option<bool>,
+    _lock_connection_mode: Option<bool>,
 ) -> Result<(), String> {
     log::info!("Setting connection mode: {:?}", mode);
+
+    if mode != ConnectionMode::Local || server_config.is_some() {
+        return Err("This offline build only supports the bundled local backend".to_string());
+    }
 
     let store = app_handle
         .store(STORE_FILE)
@@ -137,35 +88,19 @@ pub async fn set_connection_mode(
 
     // Update in-memory state
     if let Ok(mut conn_state) = state.0.lock() {
-        conn_state.mode = mode.clone();
-        conn_state.server_config = server_config.clone();
-        if let Some(lock) = lock_connection_mode {
-            conn_state.lock_connection_mode = lock;
-        }
+        conn_state.mode = ConnectionMode::Local;
+        conn_state.server_config = None;
+        conn_state.lock_connection_mode = true;
     }
 
     store.set(
         CONNECTION_MODE_KEY,
-        serde_json::to_value(&mode).map_err(|e| format!("Failed to serialize mode: {}", e))?,
+        serde_json::to_value(&ConnectionMode::Local)
+            .map_err(|e| format!("Failed to serialize mode: {}", e))?,
     );
 
-    if let Some(config) = &server_config {
-        store.set(
-            SERVER_CONFIG_KEY,
-            serde_json::to_value(config)
-                .map_err(|e| format!("Failed to serialize config: {}", e))?,
-        );
-    } else {
-        store.delete(SERVER_CONFIG_KEY);
-    }
-
-    if let Some(lock) = lock_connection_mode {
-        store.set(
-            LOCK_CONNECTION_KEY,
-            serde_json::to_value(lock)
-                .map_err(|e| format!("Failed to serialize lock flag: {}", e))?,
-        );
-    }
+    store.delete(SERVER_CONFIG_KEY);
+    store.set(LOCK_CONNECTION_KEY, serde_json::json!(true));
 
     // Mark setup as completed
     store.set(FIRST_LAUNCH_KEY, serde_json::json!(true));
@@ -181,12 +116,7 @@ pub async fn set_connection_mode(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProvisioningConfig {
-    server_url: Option<String>,
-    lock_connection_mode: Option<bool>,
     login_agreement_enabled: Option<bool>,
-    /// Optional headless-install update policy (`"prompt"`, `"auto"`, `"disabled"`).
-    /// When omitted the existing stored mode is left unchanged.
-    update_mode: Option<UpdateMode>,
 }
 
 fn provisioning_file_paths() -> Vec<PathBuf> {
@@ -207,6 +137,7 @@ fn provisioning_file_paths() -> Vec<PathBuf> {
 /// the UI based on that would let any local user permanently disable the
 /// Settings selector for themselves with no way back, because the file is
 /// deleted after apply but the lock flag persists in the store.
+#[cfg(test)]
 pub(crate) fn provisioning_path_is_admin_owned(
     provisioning_path: &std::path::Path,
     system_dir: Option<&std::path::Path>,
@@ -252,94 +183,35 @@ pub fn apply_provisioning_if_present(app_handle: &AppHandle) -> Result<(), Strin
         ));
     }
 
-    let server_url = parsed
-        .server_url
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    // Only short-circuit when there is nothing left to apply. login_agreement is handled above,
-    // but it must still be in this guard so a login-agreement-only file falls through to the
-    // deletion block at the end (otherwise the per-user file would linger and re-apply forever).
-    if server_url.is_none()
-        && parsed.update_mode.is_none()
-        && parsed.login_agreement_enabled.is_none()
-    {
+    if parsed.login_agreement_enabled.is_none() {
         add_log(
-            "⚠️ Provisioning file has no actionable fields (serverUrl/updateMode/loginAgreement); skipping apply"
+            "⚠️ Provisioning file has no actionable fields (loginAgreement); skipping apply"
                 .to_string(),
         );
         return Ok(());
     }
 
-    let lock_flag = parsed.lock_connection_mode.unwrap_or(false);
-
+    // Always persist local mode. Remote server provisioning is intentionally
+    // unsupported by this personal offline build.
     let store = app_handle
         .store(STORE_FILE)
         .map_err(|e| format!("Failed to access store: {}", e))?;
-
-    // Apply server URL / connection settings only when a URL was supplied — a
-    // provisioning file containing just `updateMode` should be allowed to configure
-    // the headless update policy without forcing self-hosted mode.
-    let server_config = if let Some(url) = server_url {
-        store.set(
-            CONNECTION_MODE_KEY,
-            serde_json::to_value(&ConnectionMode::SelfHosted)
-                .map_err(|e| format!("Failed to serialize mode: {}", e))?,
-        );
-
-        let cfg = ServerConfig { url };
-        store.set(
-            SERVER_CONFIG_KEY,
-            serde_json::to_value(&cfg)
-                .map_err(|e| format!("Failed to serialize config: {}", e))?,
-        );
-
-        store.set(
-            LOCK_CONNECTION_KEY,
-            serde_json::to_value(lock_flag)
-                .map_err(|e| format!("Failed to serialize lock flag: {}", e))?,
-        );
-
-        store.set(FIRST_LAUNCH_KEY, serde_json::json!(true));
-        Some(cfg)
-    } else {
-        None
-    };
-
-    if let Some(mode) = parsed.update_mode {
-        store.set(
-            UPDATE_MODE_KEY,
-            serde_json::to_value(&mode)
-                .map_err(|e| format!("Failed to serialize update mode: {}", e))?,
-        );
-        // Only lock the UI when the provisioning file came from a path that
-        // requires admin rights to write — i.e. the system provisioning dir
-        // populated by MSI/Intune. A user dropping a file in their own
-        // `app_data_dir` must NOT lock themselves out of the Settings
-        // selector permanently (the file is deleted after apply, but the
-        // lock flag persists in the store).
-        let system_dir = system_provisioning_dir();
-        let locked = provisioning_path_is_admin_owned(
-            &provisioning_path,
-            system_dir.as_deref(),
-        );
-        store.set(UPDATE_MODE_LOCKED_KEY, serde_json::json!(locked));
-        add_log(format!(
-            "🧩 Provisioning set update mode to {:?} (locked={})",
-            mode, locked
-        ));
-    }
+    store.set(
+        CONNECTION_MODE_KEY,
+        serde_json::to_value(&ConnectionMode::Local)
+            .map_err(|e| format!("Failed to serialize mode: {}", e))?,
+    );
+    store.delete(SERVER_CONFIG_KEY);
+    store.set(LOCK_CONNECTION_KEY, serde_json::json!(true));
 
     store
         .save()
         .map_err(|e| format!("Failed to save store: {}", e))?;
 
-    if let (Some(cfg), Ok(mut conn_state)) =
-        (server_config.as_ref(), app_handle.state::<AppConnectionState>().0.lock())
-    {
-        conn_state.mode = ConnectionMode::SelfHosted;
-        conn_state.server_config = Some(cfg.clone());
-        conn_state.lock_connection_mode = lock_flag;
+    if let Ok(mut conn_state) = app_handle.state::<AppConnectionState>().0.lock() {
+        conn_state.mode = ConnectionMode::Local;
+        conn_state.server_config = None;
+        conn_state.lock_connection_mode = true;
     }
 
     let user_app_data = app_data_dir();
@@ -381,78 +253,6 @@ pub async fn is_first_launch(app_handle: AppHandle) -> Result<bool, String> {
         .unwrap_or(false);
 
     Ok(!setup_completed)
-}
-
-/// Read the configured update mode from the tauri store.
-///
-/// Returns [`UpdateMode::Prompt`] when the store is unavailable or no mode
-/// has been set — the prompt-the-user flow is the safe default for normal,
-/// non-managed installs.
-pub(crate) fn read_update_mode(app_handle: &AppHandle) -> UpdateMode {
-    read_update_mode_info(app_handle).mode
-}
-
-/// Read the configured update mode AND whether it's locked by provisioning.
-pub(crate) fn read_update_mode_info(app_handle: &AppHandle) -> UpdateModeInfo {
-    match app_handle.store(STORE_FILE) {
-        Ok(store) => {
-            let mode = store
-                .get(UPDATE_MODE_KEY)
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            let locked = store
-                .get(UPDATE_MODE_LOCKED_KEY)
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            UpdateModeInfo { mode, locked }
-        }
-        Err(_) => UpdateModeInfo {
-            mode: UpdateMode::default(),
-            locked: false,
-        },
-    }
-}
-
-#[tauri::command]
-pub async fn get_update_mode(app_handle: AppHandle) -> Result<UpdateModeInfo, String> {
-    Ok(read_update_mode_info(&app_handle))
-}
-
-/// Update the stored update mode from the UI.
-///
-/// Refuses to overwrite a provisioned (locked) value so an MDM-managed
-/// deployment can't be subverted by a user clicking in Settings.
-#[tauri::command]
-pub async fn set_update_mode(
-    app_handle: AppHandle,
-    mode: UpdateMode,
-) -> Result<(), String> {
-    let store = app_handle
-        .store(STORE_FILE)
-        .map_err(|e| format!("Failed to access store: {}", e))?;
-
-    let locked = store
-        .get(UPDATE_MODE_LOCKED_KEY)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if locked {
-        add_log(format!(
-            "⚠️ set_update_mode({:?}) rejected — mode is locked by provisioning",
-            mode
-        ));
-        return Err("Update mode is locked by your administrator".to_string());
-    }
-
-    store.set(
-        UPDATE_MODE_KEY,
-        serde_json::to_value(&mode)
-            .map_err(|e| format!("Failed to serialize update mode: {}", e))?,
-    );
-    store
-        .save()
-        .map_err(|e| format!("Failed to save store: {}", e))?;
-    add_log(format!("⚙️ User set update mode to {:?}", mode));
-    Ok(())
 }
 
 #[tauri::command]
