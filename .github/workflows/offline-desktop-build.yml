@@ -1,0 +1,162 @@
+name: Offline Desktop Build
+
+# 纯本地离线版 Stirling-PDF 桌面端多平台构建流水线（个人自用版）。
+#
+# 用途：在 GitHub 免费 runner 上产出 Windows / macOS 安装包，
+#       无需本地拥有 Windows 或 Mac 机器，也无需任何代码签名密钥。
+#
+# 前提：仓库已应用 edit-pdf-offline-hardening.patch（离线化改造）。
+#       该补丁把后端锁定为本地模式、移除更新与统计外联、后端仅监听回环。
+#
+# 触发：Actions 页面手动运行（workflow_dispatch），或打 v* tag 时自动运行。
+#
+# 说明：
+#   - 后端使用 core flavor：jlink:jar 已内置 DISABLE_ADDITIONAL_FEATURES=true，
+#     这里再显式传一次做双保险，避开 proprietary 目录。
+#   - Tauri 无法跨平台交叉编译，因此每个平台各用一个原生 runner。
+#   - 未签名：createUpdaterArtifacts=false（离线版本不应带自动更新产物）。
+#   - macOS 拆成 arm64 / x86_64 两个单架构包（各只需一份原生 JRE），
+#     比 universal 更省 CI 时间，个人自用足够。
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "要构建的平台"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - windows
+          - macos-arm
+          - macos-intel
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            jpdfium_platforms: windows-x64
+            # 如需 NSIS 安装包，把 msi 换成 nsis
+            tauri_args: "--bundles msi"
+          - name: macos-arm64
+            os: macos-14
+            jpdfium_platforms: darwin-arm64
+            tauri_args: "--target aarch64-apple-darwin --bundles dmg"
+          - name: macos-x86_64
+            os: macos-13
+            jpdfium_platforms: darwin-x64
+            tauri_args: "--target x86_64-apple-darwin --bundles dmg"
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select platforms
+        id: pick
+        shell: bash
+        env:
+          SEL: ${{ github.event_name == 'push' && 'all' || inputs.targets }}
+          NAME: ${{ matrix.name }}
+        run: |
+          run=false
+          case "$SEL" in
+            all) run=true ;;
+            windows)     [ "$NAME" = "windows-x86_64" ] && run=true ;;
+            macos-arm)   [ "$NAME" = "macos-arm64" ] && run=true ;;
+            macos-intel) [ "$NAME" = "macos-x86_64" ] && run=true ;;
+          esac
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: steps.pick.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup JDK 25 (Temurin, bundled JRE source)
+        if: steps.pick.outputs.run == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Rust
+        if: steps.pick.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.name == 'macos-arm64' && 'aarch64-apple-darwin' || matrix.name == 'macos-x86_64' && 'x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust build
+        if: steps.pick.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/editor/src-tauri
+
+      - name: Setup Task
+        if: steps.pick.outputs.run == 'true'
+        uses: go-task/setup-task@v2
+
+      - name: Prepare desktop build (core flavor)
+        if: steps.pick.outputs.run == 'true'
+        shell: bash
+        env:
+          DISABLE_ADDITIONAL_FEATURES: "true"
+          STIRLING_FLAVOR: core
+          JPDFIUM_PLATFORMS: ${{ matrix.jpdfium_platforms }}
+        run: task desktop:prepare
+
+      - name: Run Tauri/Cargo tests
+        if: steps.pick.outputs.run == 'true'
+        run: task desktop:test
+
+      - name: Build Tauri app (unsigned, offline)
+        if: steps.pick.outputs.run == 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          SIGN: "0"
+          CI: "true"
+          # macOS DMG 在无界面 CI 上需要此开关，否则 create-dmg 会挂在 UI 交互
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+        with:
+          projectPath: ./frontend/editor
+          tauriScript: npx tauri
+          args: >-
+            ${{ matrix.tauri_args }}
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Collect installers
+        if: steps.pick.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-out
+          BASE="frontend/editor/src-tauri/target"
+          find "$BASE" -type f \( -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \) \
+            -not -path "*/deps/*" -print -exec cp {} dist-out/ \; || true
+          echo "---- collected ----"
+          ls -lh dist-out
+
+      - name: Upload installers
+        if: steps.pick.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stirling-pdf-offline-${{ matrix.name }}
+          path: dist-out/*
+          if-no-files-found: error
+          retention-days: 14
